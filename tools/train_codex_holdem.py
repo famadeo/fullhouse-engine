@@ -4,9 +4,14 @@ This is intentionally lightweight. It generates decision samples by running
 local in-process matches, then fits small linear heads:
 
   chip_ev          tanh     best counterfactual action EV, scaled
+  risk_adjusted_chip_ev
+                   tanh     chip EV penalized by bust / downside risk
   showdown_equity sigmoid  Monte Carlo / heuristic showdown equity
   fold_pressure   sigmoid  estimated fold equity from betting
   danger          sigmoid  downside risk from continuing
+  survival        sigmoid  reward for keeping the target bot alive
+  stack_preservation
+                   sigmoid  reward for preserving a playable stack
   ev_*            tanh     action-value heads for candidate actions
 
 The exported model is plain JSON, so the runtime bot does not need sklearn.
@@ -219,17 +224,25 @@ def run_training_match(match_id, modules, bot_paths, target_id, hands, seed):
 
         target_delta = stacks.get(target_id, 0) - starting.get(target_id, 0)
         target_won = target_delta > 0
+        target_stack = stacks.get(target_id, 0)
+        target_survived = target_stack > 0
+        stack_preservation = clamp(target_stack / STARTING_STACK, 0.0, 1.0)
+        survival_reward = 1.0 if target_survived else 0.0
         showdown = bool(state.get("showdown"))
         for sample in pending:
             aggressive = sample["action"] in ("raise", "all_in")
             cf_values = dict(sample["cf_values"])
             best_cf = max(cf_values.values()) if cf_values else 0.0
+            risk_adjusted = best_cf - 0.35 * sample["cf_danger"] - 0.80 * (1.0 - survival_reward)
             sample["labels"] = {
                 **cf_values,
                 "chip_ev": best_cf,
+                "risk_adjusted_chip_ev": clamp(risk_adjusted, -1.0, 1.0),
                 "showdown_equity": feature_equity(sample["features"]),
                 "fold_pressure": sample["cf_fold_pressure"],
                 "danger": sample["cf_danger"],
+                "survival": survival_reward,
+                "stack_preservation": stack_preservation,
                 "realized_chip_ev": clamp(target_delta / 5000.0, -1.0, 1.0),
                 "realized_win": 1.0 if target_won else 0.0,
                 "realized_fold_pressure": 1.0 if aggressive and target_won and not showdown else 0.0,
@@ -338,6 +351,10 @@ def main():
             "activation": "tanh",
             "weights": fit_head(train_samples, feature_names, "chip_ev", "tanh", rng),
         },
+        "risk_adjusted_chip_ev": {
+            "activation": "tanh",
+            "weights": fit_head(train_samples, feature_names, "risk_adjusted_chip_ev", "tanh", rng),
+        },
         "showdown_equity": {
             "activation": "sigmoid",
             "weights": fit_head(train_samples, feature_names, "showdown_equity", "sigmoid", rng),
@@ -349,6 +366,14 @@ def main():
         "danger": {
             "activation": "sigmoid",
             "weights": fit_head(train_samples, feature_names, "danger", "sigmoid", rng),
+        },
+        "survival": {
+            "activation": "sigmoid",
+            "weights": fit_head(train_samples, feature_names, "survival", "sigmoid", rng),
+        },
+        "stack_preservation": {
+            "activation": "sigmoid",
+            "weights": fit_head(train_samples, feature_names, "stack_preservation", "sigmoid", rng),
         },
     }
     for label_name in ("ev_fold", "ev_check_call", "ev_bet_33", "ev_bet_66", "ev_jam"):

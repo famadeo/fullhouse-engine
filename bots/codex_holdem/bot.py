@@ -512,6 +512,9 @@ def postflop_decision(state):
     fold_pressure = signals.get("fold_pressure", 0.0)
     danger = signals.get("danger", 0.5)
     chip_ev = signals.get("chip_ev", 0.0)
+    risk_ev = signals.get("risk_adjusted_chip_ev", chip_ev)
+    survival = signals.get("survival", 1.0)
+    stack_preservation = signals.get("stack_preservation", 1.0)
     required = owed / max(pot + owed, 1)
     spr = stack / max(pot, 1)
     wet = board_is_wet(state.get("community_cards", []))
@@ -528,7 +531,7 @@ def postflop_decision(state):
         if opponents <= 2 and pos >= 0.55 and equity >= 0.58:
             return raise_to(state, invested + int(pot * 0.62))
         if opponents <= 2 and pos >= 0.50 and equity >= 0.45:
-            if fold_pressure >= 0.72 and danger <= 0.35 and chip_ev >= 0.10:
+            if fold_pressure >= 0.72 and danger <= 0.35 and risk_ev >= 0.10:
                 return raise_to(state, invested + int(pot * 0.55))
         return {"action": "check"}
 
@@ -537,8 +540,10 @@ def postflop_decision(state):
         margin += 0.035
     if signals:
         margin += 0.025 * danger
-        if chip_ev > 0:
-            margin -= min(0.015, chip_ev * 0.015)
+        margin += max(0.0, 0.65 - survival) * 0.04
+        margin += max(0.0, 0.45 - stack_preservation) * 0.03
+        if risk_ev > 0:
+            margin -= min(0.015, risk_ev * 0.015)
 
     if equity >= 0.76 and spr <= 1.7:
         return {"action": "all_in"}
@@ -550,7 +555,7 @@ def postflop_decision(state):
     if equity >= required + margin:
         return {"action": "call"}
 
-    if signals and chip_ev < -0.55 and equity < required + 0.10:
+    if signals and risk_ev < -0.55 and equity < required + 0.10:
         return {"action": "fold"}
 
     if owed <= max(100, pot * 0.08) and equity >= required - 0.025:
