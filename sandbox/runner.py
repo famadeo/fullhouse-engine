@@ -22,10 +22,18 @@ import importlib.util
 import traceback
 import threading
 import os
+import random
 
 BOT_PATH        = os.environ.get("BOT_PATH", "/bot/bot.py")
 TIMEOUT         = int(os.environ.get("ACTION_TIMEOUT", "2"))
 WARMUP_TIMEOUT  = int(os.environ.get("WARMUP_TIMEOUT", "30"))
+RANDOM_SEED     = os.environ.get("BOT_RANDOM_SEED")
+
+if RANDOM_SEED is not None:
+    try:
+        random.seed(int(RANDOM_SEED))
+    except ValueError:
+        random.seed(RANDOM_SEED)
 
 
 def load_bot(path: str):
