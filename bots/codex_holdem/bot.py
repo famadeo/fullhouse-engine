@@ -13,6 +13,7 @@ except Exception:
 
 BOT_NAME = "Codex Holdem"
 MODEL_VERSION = 1
+NOMINAL_STARTING_STACK = 10000
 
 RANKS = "23456789TJQKA"
 SUITS = "shdc"
@@ -33,6 +34,18 @@ FEATURE_NAMES = [
     "actions_s", "raises_s",
     "opp_call_rate", "opp_raise_rate", "opp_fold_rate", "history_s",
 ]
+PUBLIC_BELIEF_FEATURE_NAMES = [
+    "pbs_street_progress", "pbs_board_cards_s", "pbs_board_high_s",
+    "pbs_board_pairing", "pbs_board_flushiness", "pbs_board_connectivity",
+    "pbs_live_players_s", "pbs_heads_up", "pbs_multiway",
+    "pbs_avg_opp_stack_s", "pbs_big_stack_pressure",
+    "pbs_stack_at_risk", "pbs_hero_commitment", "pbs_pot_to_stack",
+    "pbs_short_stack", "pbs_bet_size_ratio", "pbs_large_bet_pressure",
+    "pbs_action_depth_s", "pbs_recent_raise_depth_s", "pbs_all_in_seen",
+    "pbs_last_aggressor_hero", "pbs_range_narrowing",
+    "pbs_field_looseness", "pbs_field_aggression",
+]
+FEATURE_NAMES += PUBLIC_BELIEF_FEATURE_NAMES
 
 
 def load_model():
@@ -260,6 +273,111 @@ def opponent_tendencies(state):
     return calls / total, raises / total, folds / total, total
 
 
+def board_texture_features(board):
+    if not board:
+        return {
+            "pbs_board_cards_s": 0.0,
+            "pbs_board_high_s": 0.0,
+            "pbs_board_pairing": 0.0,
+            "pbs_board_flushiness": 0.0,
+            "pbs_board_connectivity": 0.0,
+        }
+
+    values = sorted({RANK_VALUE.get(c[0], 0) for c in board})
+    suits = {}
+    for card in board:
+        suits[card[1]] = suits.get(card[1], 0) + 1
+
+    if len(values) > 1:
+        gaps = [values[i + 1] - values[i] for i in range(len(values) - 1)]
+        avg_gap = sum(gaps) / len(gaps)
+        connectivity = 1.0 - clamp(avg_gap / 5.0, 0.0, 1.0)
+    else:
+        connectivity = 0.0
+
+    return {
+        "pbs_board_cards_s": clamp(len(board) / 5.0, 0.0, 1.0),
+        "pbs_board_high_s": clamp(max(values or [0]) / 14.0, 0.0, 1.0),
+        "pbs_board_pairing": 1.0 if len({c[0] for c in board}) < len(board) else 0.0,
+        "pbs_board_flushiness": clamp(max(suits.values()) / max(len(board), 1), 0.0, 1.0),
+        "pbs_board_connectivity": connectivity,
+    }
+
+
+def extract_public_belief_state(state):
+    street = state.get("street")
+    street_progress = {"preflop": 0.0, "flop": 0.33, "turn": 0.66, "river": 1.0}.get(street, 0.0)
+    hero_seat = state.get("seat_to_act")
+    players = state.get("players", [])
+    live_players = [
+        p for p in players
+        if not p.get("is_folded") and p.get("state") != "folded"
+    ]
+    opponents = [p for p in live_players if p.get("seat") != hero_seat]
+    pot = max(int(state.get("pot", 0) or 0), 1)
+    owed = int(state.get("amount_owed", 0) or 0)
+    stack = int(state.get("your_stack", 0) or 0)
+    invested = int(state.get("your_bet_this_street", 0) or 0)
+    current = int(state.get("current_bet", 0) or 0)
+    min_raise_to = int(state.get("min_raise_to", 0) or 0)
+    bb = max(100, min_raise_to - current)
+    actions, raises = action_stats(state)
+    call_rate, raise_rate, fold_rate, history_count = opponent_tendencies(state)
+
+    opp_stacks = [
+        int(p.get("stack", stack) or stack)
+        for p in opponents
+    ]
+    avg_opp_stack = sum(opp_stacks) / len(opp_stacks) if opp_stacks else stack
+    last_aggressor = None
+    recent_raises = 0
+    all_in_seen = False
+    for action in state.get("action_log", [])[-12:]:
+        if action.get("action") in ("raise", "all_in"):
+            last_aggressor = action.get("seat")
+            recent_raises += 1
+        if action.get("action") == "all_in":
+            all_in_seen = True
+
+    pressure = owed / max(pot + owed, 1)
+    bet_size_ratio = current / max(pot, 1)
+    stack_at_risk = owed / max(stack, 1)
+    hero_commitment = invested / max(stack + invested, 1)
+    range_narrowing = (
+        0.10
+        + 0.26 * clamp(raises / 6.0, 0.0, 1.0)
+        + 0.26 * pressure
+        + 0.24 * raise_rate
+        - 0.12 * call_rate
+        - 0.08 * fold_rate
+    )
+    field_looseness = 0.45 * call_rate + 0.25 * (1.0 - fold_rate) + 0.15 * (1.0 - clamp(range_narrowing, 0.0, 1.0))
+
+    belief = {
+        "pbs_street_progress": street_progress,
+        "pbs_live_players_s": clamp(len(live_players) / 8.0, 0.0, 1.0),
+        "pbs_heads_up": 1.0 if len(opponents) == 1 else 0.0,
+        "pbs_multiway": 1.0 if len(opponents) > 1 else 0.0,
+        "pbs_avg_opp_stack_s": clamp(avg_opp_stack / NOMINAL_STARTING_STACK, 0.0, 3.0),
+        "pbs_big_stack_pressure": 1.0 if opp_stacks and max(opp_stacks) > stack * 1.35 else 0.0,
+        "pbs_stack_at_risk": clamp(stack_at_risk, 0.0, 1.0),
+        "pbs_hero_commitment": clamp(hero_commitment, 0.0, 1.0),
+        "pbs_pot_to_stack": clamp(pot / max(pot + stack, 1), 0.0, 1.0),
+        "pbs_short_stack": 1.0 if stack <= bb * 18 else 0.0,
+        "pbs_bet_size_ratio": clamp(bet_size_ratio, 0.0, 3.0),
+        "pbs_large_bet_pressure": 1.0 if owed > max(pot * 0.45, bb * 3) else 0.0,
+        "pbs_action_depth_s": clamp((actions + history_count * 0.1) / 30.0, 0.0, 1.0),
+        "pbs_recent_raise_depth_s": clamp(recent_raises / 4.0, 0.0, 1.0),
+        "pbs_all_in_seen": 1.0 if all_in_seen else 0.0,
+        "pbs_last_aggressor_hero": 1.0 if last_aggressor == hero_seat else 0.0,
+        "pbs_range_narrowing": clamp(range_narrowing, 0.0, 1.0),
+        "pbs_field_looseness": clamp(field_looseness, 0.0, 1.0),
+        "pbs_field_aggression": clamp(raise_rate, 0.0, 1.0),
+    }
+    belief.update(board_texture_features(state.get("community_cards", [])))
+    return belief
+
+
 def extract_features(state, equity=None):
     cards = state.get("your_cards", [])
     category = preflop_category(cards)
@@ -308,6 +426,7 @@ def extract_features(state, equity=None):
         "opp_fold_rate": clamp(fold_rate, 0.0, 1.0),
         "history_s": clamp(history_count / 200.0, 0.0, 1.0),
     }
+    feats.update(extract_public_belief_state(state))
     return feats
 
 

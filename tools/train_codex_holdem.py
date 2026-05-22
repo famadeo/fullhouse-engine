@@ -69,6 +69,13 @@ def target_features(module, state):
     return module.extract_features(state, equity)
 
 
+def target_public_belief_state(module, state):
+    extractor = getattr(module, "extract_public_belief_state", None)
+    if extractor is None:
+        return {}
+    return extractor(state)
+
+
 def feature_equity(feats):
     return clamp(float(feats.get("equity", 0.5)), 0.0, 1.0)
 
@@ -198,6 +205,7 @@ def run_training_match(match_id, modules, bot_paths, target_id, hands, seed):
                 action = safe_decide(module, state_for_bot)
                 pending.append({
                     "features": feats,
+                    "public_belief_state": target_public_belief_state(module, state_for_bot),
                     "action": action.get("action", "fold"),
                     "street": state_for_bot.get("street"),
                     "cf_values": values,
@@ -316,6 +324,23 @@ def summarize(samples):
     return {"n_samples": len(samples), "labels": labels, "by_street": by_street}
 
 
+def summarize_public_belief(samples, feature_names):
+    if not samples or not feature_names:
+        return {}
+    summary = {}
+    for name in feature_names:
+        values = [
+            float(s.get("public_belief_state", {}).get(name, 0.0))
+            for s in samples
+        ]
+        summary[name] = {
+            "mean": round(sum(values) / len(values), 5),
+            "min": round(min(values), 5),
+            "max": round(max(values), 5),
+        }
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Codex Hold'em JSON model")
     parser.add_argument("--hands", type=int, default=1200)
@@ -345,6 +370,7 @@ def main():
         raise RuntimeError("No samples generated")
 
     feature_names = list(modules[args.target].FEATURE_NAMES)
+    public_belief_feature_names = list(getattr(modules[args.target], "PUBLIC_BELIEF_FEATURE_NAMES", []))
     train_samples = [s for s in samples if s["street"] != "preflop"] or samples
     heads = {
         "chip_ev": {
@@ -387,6 +413,7 @@ def main():
         "target": args.target,
         "runtime_enabled": False,
         "feature_names": feature_names,
+        "public_belief_feature_names": public_belief_feature_names,
         "heads": heads,
         "meta": {
             "hands": args.hands,
@@ -394,6 +421,8 @@ def main():
             "seed": args.seed,
             "summary": summarize(samples),
             "training_summary": summarize(train_samples),
+            "public_belief_summary": summarize_public_belief(samples, public_belief_feature_names),
+            "public_belief_training_summary": summarize_public_belief(train_samples, public_belief_feature_names),
         },
     }
 
