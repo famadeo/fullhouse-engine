@@ -48,22 +48,22 @@ PUBLIC_BELIEF_FEATURE_NAMES = [
 FEATURE_NAMES += PUBLIC_BELIEF_FEATURE_NAMES
 
 
-def load_model():
+def load_bot_data():
     data_dir = os.environ.get("BOT_DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
     path = os.path.join(data_dir, "model.json")
     try:
         with open(path, "r") as f:
-            model = json.load(f)
-        if model.get("version") != MODEL_VERSION:
+            data = json.load(f)
+        if data.get("version") != MODEL_VERSION:
             return None
-        if not model.get("runtime_enabled", False):
-            return None
-        return model
+        return data
     except Exception:
         return None
 
 
-MODEL = load_model()
+BOT_DATA = load_bot_data()
+MODEL = BOT_DATA if BOT_DATA and BOT_DATA.get("runtime_enabled", False) else None
+PREFLOP_STRATEGY = BOT_DATA.get("preflop_strategy", {}) if BOT_DATA else {}
 
 
 def decide(state):
@@ -170,6 +170,95 @@ def acting_position(state):
 
 def card_ranks(cards):
     return sorted([c[0] for c in cards], key=lambda r: RANK_VALUE.get(r, 0), reverse=True)
+
+
+def hand_key(cards):
+    if len(cards) < 2:
+        return ""
+    ranks = card_ranks(cards)
+    high, low = ranks[0], ranks[1]
+    if high == low:
+        return high + low
+    return high + low + ("s" if cards[0][1] == cards[1][1] else "o")
+
+
+def preflop_position_bucket(state, pos):
+    if len(state.get("players", [])) <= 2:
+        return "heads_up"
+    if pos < 0.20:
+        return "early"
+    if pos < 0.45:
+        return "middle"
+    if pos < 0.75:
+        return "late"
+    return "blind"
+
+
+def preflop_stack_bucket(stack, invested, bb):
+    effective_bb = (stack + invested) / max(bb, 1)
+    if effective_bb <= 15:
+        return "short"
+    if effective_bb <= 40:
+        return "medium"
+    return "deep"
+
+
+def configured_hands(section, bucket=None):
+    if not isinstance(section, dict):
+        return set(section or [])
+    hands = set(section.get("all", []))
+    if bucket:
+        hands.update(section.get(bucket, []))
+    return hands
+
+
+def preflop_table_plan(state, cards, pos, owed, pot, stack, invested, current, min_raise_to, bb, faced_large_raise):
+    strategy = PREFLOP_STRATEGY
+    if not strategy or not strategy.get("enabled", False):
+        return None
+
+    key = hand_key(cards)
+    if not key:
+        return None
+
+    position = preflop_position_bucket(state, pos)
+    depth = preflop_stack_bucket(stack, invested, bb)
+    open_ranges = strategy.get("rfi", {})
+    raise_ranges = strategy.get("vs_raise_continue", {})
+    large_raise_ranges = strategy.get("vs_large_raise_continue", {})
+    short_stack_ranges = strategy.get("short_stack_continue", {})
+
+    max_total = stack + invested
+    short_stack = depth == "short" or max_total <= bb * 16
+    blind_price = owed > 0 and owed <= bb and current <= bb
+    unopened = state.get("can_check") or current <= bb
+    pressure = owed / max(pot + owed, 1)
+
+    if unopened:
+        if not strategy.get("rfi_enabled", False):
+            return None
+        if key in configured_hands(open_ranges, position):
+            return "open_raise"
+        if short_stack and key in configured_hands(short_stack_ranges, position):
+            return "open_raise"
+        if not state.get("can_check") and not blind_price and position not in ("blind", "heads_up"):
+            return "open_fold"
+        return None
+
+    if faced_large_raise:
+        if short_stack and key in configured_hands(short_stack_ranges, position):
+            return "large_raise_raise"
+        if key in configured_hands(large_raise_ranges, position):
+            return "large_raise_raise"
+        if pressure >= 0.26 or position in ("early", "middle"):
+            return "large_raise_fold"
+        return None
+
+    if key in configured_hands(raise_ranges, position):
+        return "raise_continue"
+    if pressure >= 0.32 and not blind_price:
+        return "raise_fold"
+    return None
 
 
 def chen_score(cards):
@@ -476,6 +565,20 @@ def preflop_decision(state):
 
     pressure = owed / max(pot + owed, 1)
     faced_large_raise = owed > max(bb * 2, pot * 0.45)
+    table_plan = preflop_table_plan(
+        state, cards, pos, owed, pot, stack, invested, current, min_raise_to, bb, faced_large_raise
+    )
+
+    if table_plan in ("open_raise", "raise_continue"):
+        target = max(min_raise_to, current * 2 + bb, int(pot * 0.9) + owed)
+        return raise_to(state, target)
+    if table_plan == "large_raise_raise":
+        if max_total <= min_raise_to or max_total <= current * 2:
+            return {"action": "all_in"}
+        target = max(min_raise_to, current * 3 + bb, int(pot * 1.15) + owed)
+        return raise_to(state, target)
+    if table_plan in ("open_fold", "large_raise_fold", "raise_fold"):
+        return safe_fold(state)
 
     if category == "premium":
         if max_total <= min_raise_to or max_total <= current * 2:
