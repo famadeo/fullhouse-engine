@@ -1,8 +1,13 @@
-# ReBeL-Inspired Public Belief State Plan
+# Public State and Range Modeling Plan
 
-This project should treat ReBeL as a research direction, not a single feature.
-The practical goal is to make the bot reason from public game state plus inferred
-range pressure, then use search or learned values only in high-leverage spots.
+This project now treats ReBeL as a research direction, not as a label for the
+runtime feature set. The current runtime uses public-state heuristics and
+coarse opponent-range inference; it does not perform ReBeL value iteration or
+subgame solving.
+
+The practical near-term goal is to make equity and risk decisions conditional
+on inferred opponent ranges, then reserve learned values or search for a later
+offline CFR/self-play path.
 
 ## Current Foundation
 
@@ -11,6 +16,8 @@ range pressure, then use search or learned values only in high-leverage spots.
 - The trainer records public belief states and exports belief summaries.
 - The trainer can write and reload JSONL replay buffers.
 - Runtime learned behavior remains disabled until it clears benchmark gates.
+- `estimate_equity(state)` supports range-conditioned multiway postflop Monte
+  Carlo sampling from `model.json` range buckets.
 
 ## Milestone 1: Public State Quality
 
@@ -26,20 +33,18 @@ Improve and validate public-state features:
 Success criterion: belief summaries are stable across repeated fixed-seed
 training runs and correlate with known failure cases, especially maniac tables.
 
-## Milestone 2: Belief-Conditioned Value Heads
+## Milestone 2: Range-Conditioned Equity
 
-Train value heads that separate private-card value from public-state danger:
+Replace equity versus random holdings with equity versus inferred ranges:
 
-- showdown equity
-- fold pressure
-- danger
-- survival
-- stack preservation
-- risk-adjusted chip EV
-- action EVs for fold, call, small bet, large bet, jam
+- classify opponent archetypes from VPIP/PFR/aggression proxies
+- narrow ranges from current hand action pressure
+- filter postflop raise/call/stackoff ranges by board interaction
+- sample opponent hole cards from range buckets during Monte Carlo
+- keep heads-up equity on the stable uniform path unless benchmark gates say otherwise
 
-Success criterion: enabling a small high-risk override reduces bust rate without
-dropping six-max average below the current baseline.
+Success criterion: improve six-max average and/or bust rate without degrading
+heads-up regression.
 
 ## Milestone 3: Public Belief Replay Buffer
 
@@ -70,26 +75,26 @@ Implementation commands:
 Success criterion: we can train and evaluate models from saved replay data
 without rerunning full matches every time.
 
-## Milestone 4: Depth-Limited Search
+## Milestone 4: Collapse Learned Runtime Model
 
-For large pots and all-in decisions, run a small public-belief search:
+The current multi-head supervised model remains disabled. The next learned
+runtime candidate should be one of:
 
-- bucket opponent ranges from action pressure
-- enumerate candidate actions
-- simulate likely opponent responses
-- use learned leaf values for unresolved future streets
+- `V(s)` plus `pi(a|s)` trained from self-play returns
+- a regret/average-strategy network trained from MCCFR or Deep CFR samples
 
-Success criterion: seed 11 six-max bust is improved while existing heads-up
-caller performance stays positive.
+Success criterion: learned runtime behavior beats the rule-based baseline under
+fixed-seed gates before it is enabled by default.
 
-## Milestone 5: ReBeL-Like Self-Play Loop
+## Milestone 5: Offline CFR Strategy Tables
 
-Approximate the ReBeL shape:
+Tournament constraints favor offline strategy computation over runtime search.
+The clean path is:
 
-- self-play generates public-belief states
-- model predicts values and policy over the public state
-- search improves action targets
-- improved targets train the next model
+- external-sampling MCCFR or Deep CFR over abstracted states
+- 169 preflop classes and compact postflop buckets
+- average strategy exported into `data/model.json`
+- runtime uses O(1) lookup plus existing guards
 
 Success criterion: learned runtime behavior beats the rule-based baseline under
 fixed-seed gates before it is enabled by default.

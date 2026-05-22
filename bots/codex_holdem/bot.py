@@ -65,6 +65,8 @@ BOT_DATA = load_bot_data()
 MODEL = BOT_DATA if BOT_DATA and BOT_DATA.get("runtime_enabled", False) else None
 PREFLOP_STRATEGY = BOT_DATA.get("preflop_strategy", {}) if BOT_DATA else {}
 POSTFLOP_EV = BOT_DATA.get("postflop_ev", {}) if BOT_DATA else {}
+RANGE_EQUITY = BOT_DATA.get("range_equity", {}) if BOT_DATA else {}
+RANGE_CANDIDATE_CACHE = {}
 
 
 def decide(state):
@@ -363,6 +365,276 @@ def opponent_tendencies(state):
     return calls / total, raises / total, folds / total, total
 
 
+def player_for_seat(state, seat):
+    for player in state.get("players", []):
+        if player.get("seat") == seat:
+            return player
+    return {}
+
+
+def actions_for_seat(state, seat, include_current=True):
+    player = player_for_seat(state, seat)
+    bot_id = player.get("bot_id")
+    rows = []
+    if include_current:
+        rows.extend([a for a in state.get("action_log", []) if a.get("seat") == seat])
+    for action in state.get("match_action_log", []):
+        if bot_id is not None and action.get("bot_id") == bot_id:
+            rows.append(action)
+        elif bot_id is None and action.get("seat") == seat:
+            rows.append(action)
+    return rows
+
+
+def seat_action_profile(state, seat):
+    counted = [
+        a for a in actions_for_seat(state, seat)
+        if a.get("action") in ("fold", "check", "call", "raise", "all_in")
+    ]
+    if not counted:
+        return {"vpip": 0.33, "raise_rate": 0.10, "call_rate": 0.33, "fold_rate": 0.20, "count": 0}
+
+    total = len(counted)
+    raises = sum(1 for a in counted if a.get("action") in ("raise", "all_in"))
+    calls = sum(1 for a in counted if a.get("action") in ("call", "check"))
+    folds = sum(1 for a in counted if a.get("action") == "fold")
+    vpip = sum(1 for a in counted if a.get("action") in ("call", "raise", "all_in")) / total
+    return {
+        "vpip": vpip,
+        "raise_rate": raises / total,
+        "call_rate": calls / total,
+        "fold_rate": folds / total,
+        "count": total,
+    }
+
+
+def opponent_archetype(state, seat):
+    profile = seat_action_profile(state, seat)
+    if profile["count"] < RANGE_EQUITY.get("min_profile_actions", 16):
+        return "unknown"
+    if profile["vpip"] >= 0.52 and profile["raise_rate"] < 0.12:
+        return "loose_passive"
+    if profile["vpip"] >= 0.44 and profile["raise_rate"] >= 0.16:
+        return "lag"
+    if profile["vpip"] <= 0.24 and profile["raise_rate"] <= 0.10:
+        return "nitty"
+    return "tag"
+
+
+def current_hand_actions_for_seat(state, seat):
+    return [a for a in state.get("action_log", []) if a.get("seat") == seat]
+
+
+def range_bucket_hands(bucket):
+    buckets = RANGE_EQUITY.get("buckets", {})
+    hands = buckets.get(bucket, [])
+    return set(hands)
+
+
+def inferred_range_bucket(state, seat):
+    actions = current_hand_actions_for_seat(state, seat)
+    archetype = opponent_archetype(state, seat)
+    bucket = RANGE_EQUITY.get("archetype_buckets", {}).get(archetype, "unknown")
+
+    raises = sum(1 for a in actions if a.get("action") in ("raise", "all_in"))
+    calls = sum(1 for a in actions if a.get("action") == "call")
+    all_ins = sum(1 for a in actions if a.get("action") == "all_in")
+    player = player_for_seat(state, seat)
+    current_bet = int(state.get("current_bet", 0) or 0)
+    player_street_bet = int(player.get("bet_this_street", 0) or 0)
+    postflop_pressure = (
+        state.get("street") != "preflop"
+        and current_bet > 0
+        and player_street_bet >= current_bet
+    )
+
+    if all_ins or (postflop_pressure and player.get("state") == "all_in"):
+        return "stackoff"
+    if postflop_pressure and current_bet >= max(int(state.get("pot", 0) or 0) * 0.28, 300):
+        return "postflop_raise"
+    if raises >= 2:
+        return "three_bet"
+    if raises == 1:
+        return "open_raise"
+    if postflop_pressure:
+        return "postflop_call"
+    if calls:
+        return "preflop_call"
+    return bucket
+
+
+def straight_draw_like(cards, board):
+    values = sorted({RANK_VALUE.get(c[0], 0) for c in cards + board})
+    if RANK_VALUE["A"] in values:
+        values = sorted(set(values + [1]))
+    for i in range(len(values)):
+        window = [v for v in values if values[i] <= v <= values[i] + 4]
+        if len(window) >= 4:
+            return True
+    return False
+
+
+def combo_board_score(cards, board):
+    if not board:
+        return 0.0
+    ranks = {}
+    suits = {}
+    for card in cards + board:
+        ranks[card[0]] = ranks.get(card[0], 0) + 1
+        suits[card[1]] = suits.get(card[1], 0) + 1
+
+    counts = sorted(ranks.values(), reverse=True)
+    board_high = max([RANK_VALUE.get(c[0], 0) for c in board] or [0])
+    pair_cards = [
+        RANK_VALUE.get(card[0], 0)
+        for card in cards
+        if ranks.get(card[0], 0) >= 2
+    ]
+    flush_draw = max(suits.values() or [0]) >= 4
+    straight_draw = straight_draw_like(cards, board)
+
+    if counts[0] >= 3:
+        return 4.0
+    if len([c for c in counts if c >= 2]) >= 2:
+        return 3.2
+    if pair_cards:
+        best_pair = max(pair_cards)
+        if best_pair > board_high:
+            return 2.6
+        if best_pair == board_high:
+            return 2.2
+        return 1.25
+    if flush_draw and straight_draw:
+        return 2.0
+    if flush_draw or straight_draw:
+        return 1.25
+    if max([RANK_VALUE.get(c[0], 0) for c in cards] or [0]) >= RANK_VALUE["A"]:
+        return 0.55
+    return 0.0
+
+
+def combo_passes_postflop_filter(cards, board, bucket):
+    if not board:
+        return True
+    key = hand_key(cards)
+    score = combo_board_score(cards, board)
+    premium = key in range_bucket_hands("premium")
+    if bucket == "stackoff":
+        return premium or score >= RANGE_EQUITY.get("stackoff_min_board_score", 2.2)
+    if bucket == "postflop_raise":
+        return premium or score >= RANGE_EQUITY.get("raise_min_board_score", 1.2)
+    if bucket == "postflop_call":
+        return premium or score >= RANGE_EQUITY.get("call_min_board_score", 0.8)
+    return True
+
+
+def candidate_hands_for_bucket(bucket, known, board):
+    cache_key = (bucket, tuple(sorted(known)), tuple(board))
+    if cache_key in RANGE_CANDIDATE_CACHE:
+        return RANGE_CANDIDATE_CACHE[cache_key]
+
+    allowed = range_bucket_hands(bucket)
+    if not allowed:
+        allowed = range_bucket_hands("unknown")
+    candidates = []
+    deck_cards = [r + s for r in RANKS for s in SUITS if r + s not in known]
+    for i, first in enumerate(deck_cards):
+        for second in deck_cards[i + 1:]:
+            cards = [first, second]
+            if hand_key(cards) not in allowed:
+                continue
+            if not combo_passes_postflop_filter(cards, board, bucket):
+                continue
+            candidates.append((first, second))
+    if len(RANGE_CANDIDATE_CACHE) >= RANGE_EQUITY.get("candidate_cache_limit", 256):
+        RANGE_CANDIDATE_CACHE.clear()
+    RANGE_CANDIDATE_CACHE[cache_key] = candidates
+    return candidates
+
+
+def inferred_opponent_ranges(state, known, board):
+    ranges = []
+    for opponent in active_opponents(state):
+        seat = opponent.get("seat")
+        bucket = inferred_range_bucket(state, seat)
+        candidates = candidate_hands_for_bucket(bucket, known, board)
+        if not candidates and bucket not in ("unknown", "loose_passive"):
+            candidates = candidate_hands_for_bucket("unknown", known, board)
+        ranges.append(candidates)
+    return ranges
+
+
+def monte_carlo_equity(hero_cards, board_cards, deck_cards, opponents, iters, rng, range_candidates=None):
+    wins = 0.0
+    needed_board = 5 - len(board_cards)
+    if needed_board < 0:
+        return None
+
+    card_objs = {card: eval7.Card(card) for card in set(deck_cards + hero_cards + board_cards)}
+    hero_eval_cards = [card_objs[c] for c in hero_cards]
+    known = set(hero_cards + board_cards)
+
+    for _ in range(iters):
+        used = set(known)
+        opponent_cards = []
+
+        if range_candidates:
+            for candidates in range_candidates:
+                available = [
+                    combo for combo in candidates
+                    if combo[0] not in used and combo[1] not in used
+                ]
+                if available:
+                    first, second = rng.choice(available)
+                else:
+                    remaining = [card for card in deck_cards if card not in used]
+                    if len(remaining) < 2:
+                        return None
+                    first, second = rng.sample(remaining, 2)
+                used.add(first)
+                used.add(second)
+                opponent_cards.append([first, second])
+        else:
+            sample_size = needed_board + opponents * 2
+            remaining = [card for card in deck_cards if card not in used]
+            if sample_size > len(remaining):
+                return None
+            draw = rng.sample(remaining, sample_size)
+            runout_cards = board_cards + draw[:needed_board]
+            for index in range(needed_board, sample_size, 2):
+                first, second = draw[index], draw[index + 1]
+                used.add(first)
+                used.add(second)
+                opponent_cards.append([first, second])
+            runout_eval = [card_objs[c] for c in runout_cards]
+            hero_score = eval7.evaluate(hero_eval_cards + runout_eval)
+            scores = [hero_score]
+            for cards in opponent_cards:
+                scores.append(eval7.evaluate([card_objs[c] for c in cards] + runout_eval))
+
+            best = max(scores)
+            if hero_score == best:
+                winners = sum(1 for score in scores if score == best)
+                wins += 1.0 / winners
+            continue
+
+        remaining_board = [card for card in deck_cards if card not in used]
+        if needed_board > len(remaining_board):
+            return None
+        runout_cards = board_cards + rng.sample(remaining_board, needed_board)
+        runout_eval = [card_objs[c] for c in runout_cards]
+        hero_score = eval7.evaluate(hero_eval_cards + runout_eval)
+        scores = [hero_score]
+        for cards in opponent_cards:
+            scores.append(eval7.evaluate([card_objs[c] for c in cards] + runout_eval))
+
+        best = max(scores)
+        if hero_score == best:
+            winners = sum(1 for score in scores if score == best)
+            wins += 1.0 / winners
+    return wins / max(iters, 1)
+
+
 def board_texture_features(board):
     if not board:
         return {
@@ -644,14 +916,15 @@ def estimate_equity(state):
     if eval7 is None:
         return heuristic_equity(state)
 
-    hero_cards = [eval7.Card(c) for c in state.get("your_cards", [])]
-    board_cards = [eval7.Card(c) for c in state.get("community_cards", [])]
+    hero_cards = list(state.get("your_cards", []))
+    board_cards = list(state.get("community_cards", []))
     if len(hero_cards) != 2:
         return 0.0
 
-    known = set([str(c) for c in hero_cards + board_cards])
-    deck = [eval7.Card(r + s) for r in RANKS for s in SUITS if r + s not in known]
-    opponents = max(1, len(active_opponents(state)))
+    known = set(hero_cards + board_cards)
+    deck = [r + s for r in RANKS for s in SUITS if r + s not in known]
+    opponent_players = active_opponents(state)
+    opponents = max(1, len(opponent_players))
     street = state.get("street")
     iters = 90 if street == "flop" else 120 if street == "turn" else 180
     if opponents >= 4:
@@ -659,28 +932,51 @@ def estimate_equity(state):
     elif opponents == 3:
         iters = max(60, int(iters * 0.7))
 
-    rng = random.Random(stable_seed(state))
-    wins = 0.0
-    needed_board = 5 - len(board_cards)
-    sample_size = needed_board + opponents * 2
-    if sample_size > len(deck):
+    if 5 - len(board_cards) + opponents * 2 > len(deck):
         return heuristic_equity(state)
 
-    for _ in range(iters):
-        draw = rng.sample(deck, sample_size)
-        runout = board_cards + draw[:needed_board]
-        cursor = needed_board
-        hero_score = eval7.evaluate(hero_cards + runout)
-        scores = [hero_score]
-        for _opp in range(opponents):
-            opp_cards = draw[cursor:cursor + 2]
-            cursor += 2
-            scores.append(eval7.evaluate(opp_cards + runout))
-        best = max(scores)
-        if hero_score == best:
-            winners = sum(1 for s in scores if s == best)
-            wins += 1.0 / winners
-    return wins / max(iters, 1)
+    pot = max(int(state.get("pot", 0) or 0), 1)
+    stack = int(state.get("your_stack", 0) or 0)
+    owed = int(state.get("amount_owed", 0) or 0)
+    spr = stack / max(pot, 1)
+    pressure = owed / max(pot + owed, 1)
+    high_leverage = (
+        spr <= RANGE_EQUITY.get("max_spr", 2.2)
+        or pressure >= RANGE_EQUITY.get("min_pressure", 0.28)
+        or opponents >= RANGE_EQUITY.get("always_opponents", 4)
+    )
+
+    use_ranges = (
+        RANGE_EQUITY.get("enabled", False)
+        and street != "preflop"
+        and opponents >= RANGE_EQUITY.get("min_opponents", 2)
+        and len(state.get("players", [])) >= RANGE_EQUITY.get("min_table_size", 5)
+        and (high_leverage or not RANGE_EQUITY.get("high_leverage_only", True))
+    )
+
+    if use_ranges:
+        ranges = inferred_opponent_ranges(state, known, board_cards)
+        if ranges and any(ranges):
+            range_rng = random.Random(stable_seed(state) + 7919)
+            range_equity = monte_carlo_equity(
+                hero_cards, board_cards, deck, opponents, iters, range_rng, ranges
+            )
+            if range_equity is not None:
+                blend = clamp(RANGE_EQUITY.get("blend", 0.70), 0.0, 1.0)
+                if blend >= 0.999:
+                    return range_equity
+                uniform_rng = random.Random(stable_seed(state) + 104729)
+                uniform_equity = monte_carlo_equity(
+                    hero_cards, board_cards, deck, opponents, iters, uniform_rng
+                )
+                if uniform_equity is not None:
+                    return clamp(blend * range_equity + (1.0 - blend) * uniform_equity, 0.0, 1.0)
+
+    rng = random.Random(stable_seed(state))
+    equity = monte_carlo_equity(hero_cards, board_cards, deck, opponents, iters, rng)
+    if equity is None:
+        return heuristic_equity(state)
+    return equity
 
 
 def heuristic_equity(state):

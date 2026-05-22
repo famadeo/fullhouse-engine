@@ -1561,5 +1561,44 @@
     "min_call_edge": 90,
     "multiway_call_tax": 80,
     "large_call_tax": 120
+  },
+  "range_equity": {
+    "version": 1,
+    "enabled": true,
+    "mode": "coarse_action_conditioned",
+    "description": "Multiway postflop equity sampler. Opponent hole cards are sampled from coarse action/archetype ranges instead of uniformly random holdings.",
+    "min_opponents": 2,
+    "min_table_size": 5,
+    "min_profile_actions": 16,
+    "blend": 1.0,
+    "high_leverage_only": false,
+    "max_spr": 2.2,
+    "min_pressure": 0.28,
+    "always_opponents": 4,
+    "candidate_cache_limit": 256,
+    "stackoff_min_board_score": 2.2,
+    "raise_min_board_score": 1.2,
+    "call_min_board_score": 0.8,
+    "archetype_buckets": {
+      "unknown": "unknown",
+      "nitty": "nitty",
+      "tag": "tag",
+      "lag": "lag",
+      "loose_passive": "loose_passive"
+    },
+    "buckets": {
+      "premium": ["AA", "KK", "QQ", "JJ", "TT", "99", "AKs", "AKo", "AQs", "AQo"],
+      "stackoff": ["AA", "KK", "QQ", "JJ", "TT", "99", "AKs", "AKo", "AQs", "AQo", "AJs", "KQs"],
+      "three_bet": ["AA", "KK", "QQ", "JJ", "TT", "99", "88", "AKs", "AKo", "AQs", "AQo", "AJs", "AJo", "ATs", "KQs", "KQo", "KJs", "QJs"],
+      "postflop_raise": ["AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66", "AKs", "AKo", "AQs", "AQo", "AJs", "AJo", "ATs", "A9s", "A5s", "A4s", "KQs", "KQo", "KJs", "KTs", "QJs", "QTs", "JTs", "T9s", "98s", "87s"],
+      "postflop_call": ["AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66", "55", "44", "33", "22", "AKs", "AKo", "AQs", "AQo", "AJs", "AJo", "ATs", "ATo", "A9s", "A8s", "A7s", "A6s", "A5s", "A4s", "A3s", "A2s", "KQs", "KQo", "KJs", "KJo", "KTs", "K9s", "QJs", "QJo", "QTs", "Q9s", "JTs", "JTo", "J9s", "T9s", "T8s", "98s", "97s", "87s", "76s", "65s", "54s"],
+      "open_raise": ["AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66", "55", "44", "AKs", "AKo", "AQs", "AQo", "AJs", "AJo", "ATs", "ATo", "A9s", "A8s", "A7s", "A6s", "A5s", "A4s", "A3s", "A2s", "KQs", "KQo", "KJs", "KJo", "KTs", "K9s", "QJs", "QJo", "QTs", "Q9s", "JTs", "JTo", "J9s", "T9s", "T8s", "98s", "97s", "87s", "76s", "65s", "54s"],
+      "preflop_call": ["QQ", "JJ", "TT", "99", "88", "77", "66", "55", "44", "33", "22", "AQs", "AQo", "AJs", "AJo", "ATs", "A9s", "A8s", "A7s", "A6s", "A5s", "A4s", "A3s", "A2s", "KQs", "KQo", "KJs", "KJo", "KTs", "K9s", "QJs", "QJo", "QTs", "Q9s", "JTs", "JTo", "J9s", "T9s", "T8s", "98s", "97s", "87s", "76s", "65s", "54s"],
+      "nitty": ["AA", "KK", "QQ", "JJ", "TT", "99", "88", "AKs", "AKo", "AQs", "AQo", "AJs", "KQs"],
+      "tag": ["AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66", "AKs", "AKo", "AQs", "AQo", "AJs", "AJo", "ATs", "A9s", "A5s", "A4s", "KQs", "KQo", "KJs", "KTs", "QJs", "QTs", "JTs", "T9s", "98s"],
+      "lag": ["AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66", "55", "44", "33", "22", "AKs", "AKo", "AQs", "AQo", "AJs", "AJo", "ATs", "ATo", "A9s", "A9o", "A8s", "A7s", "A6s", "A5s", "A4s", "A3s", "A2s", "KQs", "KQo", "KJs", "KJo", "KTs", "KTo", "K9s", "K8s", "QJs", "QJo", "QTs", "QTo", "Q9s", "JTs", "JTo", "J9s", "T9s", "T8s", "98s", "97s", "87s", "86s", "76s", "75s", "65s", "54s"],
+      "loose_passive": ["AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66", "55", "44", "33", "22", "AKs", "AKo", "AQs", "AQo", "AJs", "AJo", "ATs", "ATo", "A9s", "A9o", "A8s", "A8o", "A7s", "A6s", "A5s", "A4s", "A3s", "A2s", "KQs", "KQo", "KJs", "KJo", "KTs", "KTo", "K9s", "K8s", "QJs", "QJo", "QTs", "QTo", "Q9s", "Q8s", "JTs", "JTo", "J9s", "J8s", "T9s", "T8s", "98s", "97s", "87s", "86s", "76s", "75s", "65s", "64s", "54s", "53s"],
+      "unknown": ["AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66", "55", "44", "33", "22", "AKs", "AKo", "AQs", "AQo", "AJs", "AJo", "ATs", "ATo", "A9s", "A8s", "A7s", "A6s", "A5s", "A4s", "A3s", "A2s", "KQs", "KQo", "KJs", "KJo", "KTs", "KTo", "K9s", "K8s", "QJs", "QJo", "QTs", "QTo", "Q9s", "JTs", "JTo", "J9s", "T9s", "T8s", "98s", "97s", "87s", "76s", "65s", "54s"]
+    }
   }
 }
