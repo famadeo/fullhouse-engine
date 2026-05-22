@@ -39,6 +39,7 @@ DEFAULT_BOTS = {
     "template": "bots/template",
     "ref_bot_2": "bots/ref_bot_2",
 }
+REPLAY_SCHEMA_VERSION = 1
 
 
 def load_bot(bot_id, bot_path):
@@ -74,6 +75,55 @@ def target_public_belief_state(module, state):
     if extractor is None:
         return {}
     return extractor(state)
+
+
+def legal_context(state):
+    stack = int(state.get("your_stack", 0) or 0)
+    invested = int(state.get("your_bet_this_street", 0) or 0)
+    owed = int(state.get("amount_owed", 0) or 0)
+    min_raise_to = int(state.get("min_raise_to", 0) or 0)
+    legal_actions = []
+    if state.get("can_check"):
+        legal_actions.append("check")
+    else:
+        legal_actions.extend(["fold", "call"])
+    if stack > 0:
+        legal_actions.append("all_in")
+    if stack + invested > min_raise_to > 0:
+        legal_actions.append("raise")
+
+    return {
+        "legal_actions": sorted(set(legal_actions)),
+        "can_check": bool(state.get("can_check")),
+        "amount_owed": owed,
+        "current_bet": int(state.get("current_bet", 0) or 0),
+        "min_raise_to": min_raise_to,
+        "pot": int(state.get("pot", 0) or 0),
+        "your_stack": stack,
+        "your_bet_this_street": invested,
+    }
+
+
+def public_context(state):
+    players = []
+    for player in state.get("players", []):
+        players.append({
+            "seat": player.get("seat"),
+            "bot_id": player.get("bot_id"),
+            "stack": int(player.get("stack", 0) or 0),
+            "bet": int(player.get("bet", 0) or 0),
+            "state": player.get("state"),
+            "is_folded": bool(player.get("is_folded")),
+        })
+    return {
+        "street": state.get("street"),
+        "seat_to_act": state.get("seat_to_act"),
+        "button": state.get("button"),
+        "community_cards": list(state.get("community_cards", [])),
+        "pot": int(state.get("pot", 0) or 0),
+        "current_bet": int(state.get("current_bet", 0) or 0),
+        "players": players,
+    }
 
 
 def feature_equity(feats):
@@ -164,6 +214,15 @@ def counterfactual_values(state, feats):
     }, fold_pressure, clamp(downside / max(stack, 1), 0.0, 1.0)
 
 
+def opponent_responses_after(hand_action_log, decision_index, target_id):
+    responses = []
+    for row in hand_action_log[decision_index + 1:]:
+        if row.get("bot_id") == target_id:
+            break
+        responses.append(row)
+    return responses
+
+
 def run_training_match(match_id, modules, bot_paths, target_id, hands, seed):
     random.seed(seed)
     bot_ids = list(bot_paths.keys())
@@ -189,6 +248,7 @@ def run_training_match(match_id, modules, bot_paths, target_id, hands, seed):
         )
 
         pending = []
+        hand_action_log = []
         state = engine.start_hand()
         steps = 0
 
@@ -204,8 +264,17 @@ def run_training_match(match_id, modules, bot_paths, target_id, hands, seed):
                 values, fold_pressure, danger = counterfactual_values(state_for_bot, feats)
                 action = safe_decide(module, state_for_bot)
                 pending.append({
+                    "schema_version": REPLAY_SCHEMA_VERSION,
+                    "match_id": match_id,
+                    "hand_id": hand_id,
+                    "hand_num": hand_num,
+                    "hand_seed": hand_seed,
+                    "seat": seat,
+                    "decision_index": len(hand_action_log),
                     "features": feats,
                     "public_belief_state": target_public_belief_state(module, state_for_bot),
+                    "public_context": public_context(state_for_bot),
+                    "legal_context": legal_context(state_for_bot),
                     "action": action.get("action", "fold"),
                     "street": state_for_bot.get("street"),
                     "cf_values": values,
@@ -215,13 +284,17 @@ def run_training_match(match_id, modules, bot_paths, target_id, hands, seed):
             else:
                 action = safe_decide(module, state_for_bot)
 
-            match_action_log.append({
+            action_row = {
                 "hand_num": hand_num,
+                "hand_id": hand_id,
+                "street": state.get("street"),
                 "seat": seat,
                 "bot_id": bot_id,
                 "action": action.get("action"),
                 "amount": action.get("amount"),
-            })
+            }
+            match_action_log.append(action_row)
+            hand_action_log.append(action_row)
             state = engine.apply_action(seat, action)
             steps += 1
             if steps > 1000:
@@ -242,6 +315,19 @@ def run_training_match(match_id, modules, bot_paths, target_id, hands, seed):
             cf_values = dict(sample["cf_values"])
             best_cf = max(cf_values.values()) if cf_values else 0.0
             risk_adjusted = best_cf - 0.35 * sample["cf_danger"] - 0.80 * (1.0 - survival_reward)
+            sample["opponent_responses"] = opponent_responses_after(
+                hand_action_log,
+                sample["decision_index"],
+                target_id,
+            )
+            sample["terminal"] = {
+                "target_delta": target_delta,
+                "target_stack": target_stack,
+                "target_survived": target_survived,
+                "target_won": target_won,
+                "showdown": showdown,
+                "final_stacks": state.get("final_stacks", {}),
+            }
             sample["labels"] = {
                 **cf_values,
                 "chip_ev": best_cf,
@@ -260,6 +346,55 @@ def run_training_match(match_id, modules, bot_paths, target_id, hands, seed):
         dealer += 1
 
     return samples
+
+
+def write_replay(path, samples, meta):
+    output = ROOT / path
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with open(output, "w") as f:
+        f.write(json.dumps({
+            "type": "metadata",
+            "schema_version": REPLAY_SCHEMA_VERSION,
+            "meta": meta,
+        }, sort_keys=True) + "\n")
+        for idx, sample in enumerate(samples):
+            f.write(json.dumps({
+                "type": "sample",
+                "schema_version": REPLAY_SCHEMA_VERSION,
+                "sample_id": idx,
+                "sample": sample,
+            }, sort_keys=True) + "\n")
+    return output
+
+
+def load_replay(paths):
+    samples = []
+    metadata = []
+    for raw_path in paths:
+        path = ROOT / raw_path
+        with open(path, "r") as f:
+            for line_num, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                record_type = record.get("type")
+                if record_type == "metadata":
+                    metadata.append(record.get("meta", {}))
+                elif record_type == "sample":
+                    samples.append(record.get("sample", {}))
+                else:
+                    raise ValueError(str(path) + ":" + str(line_num) + " has unknown replay record type")
+    return samples, metadata
+
+
+def display_path(path):
+    if path is None:
+        return None
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
 
 
 def clamp(value, lo, hi):
@@ -348,30 +483,70 @@ def main():
     parser.add_argument("--seed", type=int, default=20260521)
     parser.add_argument("--target", default="codex_holdem")
     parser.add_argument("--output", default="bots/codex_holdem/data/model.json")
+    parser.add_argument(
+        "--replay-input",
+        action="append",
+        default=[],
+        help="Read training samples from a JSONL replay buffer. May be repeated.",
+    )
+    parser.add_argument(
+        "--replay-output",
+        help="Write generated or loaded training samples to a JSONL replay buffer.",
+    )
+    parser.add_argument(
+        "--generate-only",
+        action="store_true",
+        help="Generate and optionally write replay samples without fitting a model.",
+    )
     parser.add_argument("--summary", action="store_true")
     args = parser.parse_args()
 
     bot_paths = dict(DEFAULT_BOTS)
     modules = {bid: load_bot(bid, path) for bid, path in bot_paths.items()}
     rng = random.Random(args.seed)
-    hands_per_match = max(1, args.hands // max(1, args.matches))
-    samples = []
-    for match_idx in range(max(1, args.matches)):
-        match_seed = args.seed + match_idx * 7919
-        samples.extend(run_training_match(
-            "train_" + str(args.seed) + "_m" + str(match_idx),
-            modules,
-            bot_paths,
-            args.target,
-            hands_per_match,
-            match_seed,
-        ))
+    replay_metadata = []
+    if args.replay_input:
+        samples, replay_metadata = load_replay(args.replay_input)
+    else:
+        hands_per_match = max(1, args.hands // max(1, args.matches))
+        samples = []
+        for match_idx in range(max(1, args.matches)):
+            match_seed = args.seed + match_idx * 7919
+            samples.extend(run_training_match(
+                "train_" + str(args.seed) + "_m" + str(match_idx),
+                modules,
+                bot_paths,
+                args.target,
+                hands_per_match,
+                match_seed,
+            ))
     if not samples:
         raise RuntimeError("No samples generated")
 
     feature_names = list(modules[args.target].FEATURE_NAMES)
     public_belief_feature_names = list(getattr(modules[args.target], "PUBLIC_BELIEF_FEATURE_NAMES", []))
     train_samples = [s for s in samples if s["street"] != "preflop"] or samples
+    replay_meta = {
+        "target": args.target,
+        "hands": args.hands,
+        "matches": args.matches,
+        "seed": args.seed,
+        "n_samples": len(samples),
+        "summary": summarize(samples),
+        "public_belief_summary": summarize_public_belief(samples, public_belief_feature_names),
+        "source_replay_metadata": replay_metadata,
+    }
+    replay_output = None
+    if args.replay_output:
+        replay_output = write_replay(args.replay_output, samples, replay_meta)
+
+    if args.generate_only:
+        print(json.dumps({
+            "replay_output": display_path(replay_output),
+            "summary": replay_meta["summary"],
+        }, indent=2, sort_keys=True))
+        return
+
     heads = {
         "chip_ev": {
             "activation": "tanh",
@@ -423,6 +598,8 @@ def main():
             "training_summary": summarize(train_samples),
             "public_belief_summary": summarize_public_belief(samples, public_belief_feature_names),
             "public_belief_training_summary": summarize_public_belief(train_samples, public_belief_feature_names),
+            "replay_input": args.replay_input,
+            "replay_output": display_path(replay_output),
         },
     }
 
@@ -433,7 +610,8 @@ def main():
         f.write("\n")
 
     print(json.dumps({
-        "output": str(output.relative_to(ROOT)),
+        "output": display_path(output),
+        "replay_output": display_path(replay_output),
         "summary": model["meta"]["summary"],
     }, indent=2, sort_keys=True))
 

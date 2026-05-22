@@ -9,6 +9,7 @@ range pressure, then use search or learned values only in high-leverage spots.
 - The bot exposes `extract_public_belief_state(state)`.
 - Public belief features are included in the model feature vector.
 - The trainer records public belief states and exports belief summaries.
+- The trainer can write and reload JSONL replay buffers.
 - Runtime learned behavior remains disabled until it clears benchmark gates.
 
 ## Milestone 1: Public State Quality
@@ -50,6 +51,21 @@ Store training samples as public-state records:
 - chosen action
 - opponent responses
 - terminal stack deltas
+
+Implementation commands:
+
+```bash
+/tmp/fullhouse-py310/bin/python tools/train_codex_holdem.py \
+  --hands 12000 \
+  --matches 60 \
+  --seed 6161 \
+  --replay-output replays/public_belief_6161.jsonl \
+  --generate-only
+
+/tmp/fullhouse-py310/bin/python tools/train_codex_holdem.py \
+  --replay-input replays/public_belief_6161.jsonl \
+  --output bots/codex_holdem/data/model.json
+```
 
 Success criterion: we can train and evaluate models from saved replay data
 without rerunning full matches every time.
