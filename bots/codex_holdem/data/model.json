@@ -1540,5 +1540,26 @@
         "QJs"
       ]
     }
+  },
+  "postflop_ev": {
+    "version": 1,
+    "enabled": true,
+    "mode": "veto_only",
+    "description": "Conservative postflop EV guard. It may veto bets/jams into passive lines and marginal calls into folds, but never creates new aggression.",
+    "min_bet_edge": 180,
+    "multiway_tax": 140,
+    "wet_board_tax": 90,
+    "low_spr_tax": 120,
+    "never_veto_equity": 0.82,
+    "multiway_equity_discount": 0.045,
+    "range_narrowing_discount": 0.1,
+    "recent_raise_discount": 0.05,
+    "wet_equity_discount": 0.025,
+    "stackoff_equity_discount": 0.04,
+    "passive_discount_ratio": 0.45,
+    "never_veto_call_equity": 0.74,
+    "min_call_edge": 90,
+    "multiway_call_tax": 80,
+    "large_call_tax": 120
   }
 }

@@ -64,6 +64,7 @@ def load_bot_data():
 BOT_DATA = load_bot_data()
 MODEL = BOT_DATA if BOT_DATA and BOT_DATA.get("runtime_enabled", False) else None
 PREFLOP_STRATEGY = BOT_DATA.get("preflop_strategy", {}) if BOT_DATA else {}
+POSTFLOP_EV = BOT_DATA.get("postflop_ev", {}) if BOT_DATA else {}
 
 
 def decide(state):
@@ -744,6 +745,107 @@ def public_thin_stackoff_risk(state, equity, spr, opponents, wet):
     )
 
 
+def postflop_fold_probability(state, bet_amount, pot, opponents, wet, belief):
+    call_rate, raise_rate, fold_rate, history_count = opponent_tendencies(state)
+    bet_ratio = bet_amount / max(pot + bet_amount, 1)
+    field_looseness = belief.get("pbs_field_looseness", 0.35)
+    range_narrowing = belief.get("pbs_range_narrowing", 0.0)
+    recent_raises = belief.get("pbs_recent_raise_depth_s", 0.0)
+
+    probability = (
+        0.18
+        + 0.34 * fold_rate
+        + 0.16 * bet_ratio
+        + 0.08 * range_narrowing
+        - 0.26 * call_rate
+        - 0.18 * raise_rate
+        - 0.18 * max(0, opponents - 1)
+        - 0.10 * field_looseness
+        - 0.08 * recent_raises
+        - (0.08 if wet else 0.0)
+    )
+    if history_count < 25:
+        probability = 0.65 * probability + 0.35 * (0.16 - 0.12 * max(0, opponents - 1))
+    return clamp(probability, 0.02, 0.68 if opponents == 1 else 0.36)
+
+
+def postflop_showdown_ev(equity, pot_after_call, cost):
+    return equity * pot_after_call - (1.0 - equity) * cost
+
+
+def postflop_realized_equity(equity, bet_amount, stack, opponents, wet, belief, passive=False):
+    discount = 0.0
+    discount += max(0, opponents - 1) * POSTFLOP_EV.get("multiway_equity_discount", 0.045)
+    discount += belief.get("pbs_range_narrowing", 0.0) * POSTFLOP_EV.get("range_narrowing_discount", 0.10)
+    discount += belief.get("pbs_recent_raise_depth_s", 0.0) * POSTFLOP_EV.get("recent_raise_discount", 0.05)
+    if wet:
+        discount += POSTFLOP_EV.get("wet_equity_discount", 0.025)
+    if bet_amount >= stack * 0.75:
+        discount += POSTFLOP_EV.get("stackoff_equity_discount", 0.04)
+    if passive:
+        discount *= POSTFLOP_EV.get("passive_discount_ratio", 0.45)
+    return clamp(equity - discount, 0.02, 0.98)
+
+
+def postflop_bet_ev(state, equity, bet_amount, pot, opponents, wet, belief):
+    fold_probability = postflop_fold_probability(state, bet_amount, pot, opponents, wet, belief)
+    realized_equity = postflop_realized_equity(
+        equity, bet_amount, int(state.get("your_stack", 0) or 0), opponents, wet, belief
+    )
+    called_ev = postflop_showdown_ev(realized_equity, pot + bet_amount, bet_amount)
+    return fold_probability * pot + (1.0 - fold_probability) * called_ev
+
+
+def postflop_ev_veto(state, equity, bet_amount, owed, pot, stack, opponents, spr, wet):
+    if not POSTFLOP_EV.get("enabled", False):
+        return None
+    if equity >= POSTFLOP_EV.get("never_veto_equity", 0.82):
+        return None
+
+    belief = extract_public_belief_state(state)
+    bet_amount = max(0, min(int(bet_amount), int(stack + owed)))
+    if bet_amount <= 0:
+        return None
+
+    bet_ev = postflop_bet_ev(state, equity, bet_amount, pot, opponents, wet, belief)
+    passive_equity = postflop_realized_equity(equity, 0, stack, opponents, wet, belief, passive=True)
+    if owed > 0:
+        call_ev = postflop_showdown_ev(passive_equity, pot + owed, owed)
+        fallback = {"action": "call"} if call_ev >= 0 else {"action": "fold"}
+        passive_ev = call_ev
+    else:
+        fallback = {"action": "check"}
+        passive_ev = postflop_showdown_ev(passive_equity, pot, 0)
+
+    multiway_tax = max(0, opponents - 1) * POSTFLOP_EV.get("multiway_tax", 140)
+    wet_tax = POSTFLOP_EV.get("wet_board_tax", 90) if wet else 0
+    low_spr_tax = POSTFLOP_EV.get("low_spr_tax", 120) if spr <= 1.5 else 0
+    required_edge = POSTFLOP_EV.get("min_bet_edge", 180) + multiway_tax + wet_tax + low_spr_tax
+
+    if bet_ev + required_edge < passive_ev:
+        return fallback
+    return None
+
+
+def postflop_call_veto(state, equity, owed, pot, stack, opponents, wet):
+    if not POSTFLOP_EV.get("enabled", False):
+        return None
+    if owed <= 0 or equity >= POSTFLOP_EV.get("never_veto_call_equity", 0.74):
+        return None
+
+    belief = extract_public_belief_state(state)
+    realized_equity = postflop_realized_equity(equity, 0, stack, opponents, wet, belief, passive=True)
+    call_ev = postflop_showdown_ev(realized_equity, pot + owed, owed)
+    call_edge = POSTFLOP_EV.get("min_call_edge", 90)
+    pressure = owed / max(pot + owed, 1)
+    extra_edge = max(0, opponents - 1) * POSTFLOP_EV.get("multiway_call_tax", 80)
+    if pressure >= 0.32:
+        extra_edge += POSTFLOP_EV.get("large_call_tax", 120)
+    if call_ev + call_edge + extra_edge < 0:
+        return {"action": "fold"}
+    return None
+
+
 def postflop_decision(state):
     owed = int(state.get("amount_owed", 0) or 0)
     pot = max(int(state.get("pot", 0) or 0), 1)
@@ -773,14 +875,29 @@ def postflop_decision(state):
             if spr <= 1.1:
                 if public_thin_stackoff_risk(state, equity, spr, opponents, wet):
                     return {"action": "check"}
+                veto = postflop_ev_veto(state, equity, stack, owed, pot, stack, opponents, spr, wet)
+                if veto:
+                    return veto
                 return {"action": "all_in"}
             fraction = 0.72 if wet else 0.58
-            return raise_to(state, invested + int(pot * fraction))
+            bet_amount = int(pot * fraction)
+            veto = postflop_ev_veto(state, equity, bet_amount, owed, pot, stack, opponents, spr, wet)
+            if veto:
+                return veto
+            return raise_to(state, invested + bet_amount)
         if opponents <= 2 and pos >= 0.55 and equity >= 0.58:
-            return raise_to(state, invested + int(pot * 0.62))
+            bet_amount = int(pot * 0.62)
+            veto = postflop_ev_veto(state, equity, bet_amount, owed, pot, stack, opponents, spr, wet)
+            if veto:
+                return veto
+            return raise_to(state, invested + bet_amount)
         if opponents <= 2 and pos >= 0.50 and equity >= 0.45:
             if fold_pressure >= 0.72 and danger <= 0.35 and risk_ev >= 0.10:
-                return raise_to(state, invested + int(pot * 0.55))
+                bet_amount = int(pot * 0.55)
+                veto = postflop_ev_veto(state, equity, bet_amount, owed, pot, stack, opponents, spr, wet)
+                if veto:
+                    return veto
+                return raise_to(state, invested + bet_amount)
         return {"action": "check"}
 
     margin = 0.035 + max(0, opponents - 1) * 0.035
@@ -794,19 +911,32 @@ def postflop_decision(state):
             margin -= min(0.015, risk_ev * 0.015)
 
     if equity >= 0.76 and spr <= 1.7:
+        veto = postflop_ev_veto(state, equity, stack, owed, pot, stack, opponents, spr, wet)
+        if veto:
+            return veto
         return {"action": "all_in"}
 
     if equity >= max(0.68, required + 0.20):
         fraction = 0.78 if wet else 0.62
-        return raise_to(state, invested + owed + int((pot + owed) * fraction))
+        bet_amount = owed + int((pot + owed) * fraction)
+        veto = postflop_ev_veto(state, equity, bet_amount, owed, pot, stack, opponents, spr, wet)
+        if veto:
+            return veto
+        return raise_to(state, invested + bet_amount)
 
     if equity >= required + margin:
+        veto = postflop_call_veto(state, equity, owed, pot, stack, opponents, wet)
+        if veto:
+            return veto
         return {"action": "call"}
 
     if signals and risk_ev < -0.55 and equity < required + 0.10:
         return {"action": "fold"}
 
     if owed <= max(100, pot * 0.08) and equity >= required - 0.025:
+        veto = postflop_call_veto(state, equity, owed, pot, stack, opponents, wet)
+        if veto:
+            return veto
         return {"action": "call"}
 
     return {"action": "fold"}
