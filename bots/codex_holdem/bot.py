@@ -617,6 +617,30 @@ def board_is_wet(board):
     return flushy or connected or paired
 
 
+def public_thin_stackoff_risk(state, equity, spr, opponents, wet):
+    table_size = len(state.get("players", []))
+    if table_size < 5 or equity >= 0.74 or spr > 1.2:
+        return False
+
+    belief = extract_public_belief_state(state)
+    range_narrowing = belief.get("pbs_range_narrowing", 0.0)
+    field_aggression = belief.get("pbs_field_aggression", 0.0)
+    recent_raise_depth = belief.get("pbs_recent_raise_depth_s", 0.0)
+    pot_to_stack = belief.get("pbs_pot_to_stack", 0.0)
+    hero_commitment = belief.get("pbs_hero_commitment", 0.0)
+    all_in_seen = belief.get("pbs_all_in_seen", 0.0) >= 0.5
+    big_stack_pressure = belief.get("pbs_big_stack_pressure", 0.0) >= 0.5
+
+    return (
+        all_in_seen
+        or hero_commitment >= 0.35
+        or pot_to_stack >= 0.45
+        or (opponents >= 2 and range_narrowing >= 0.28)
+        or (field_aggression >= 0.22 and recent_raise_depth >= 0.25)
+        or (big_stack_pressure and wet)
+    )
+
+
 def postflop_decision(state):
     owed = int(state.get("amount_owed", 0) or 0)
     pot = max(int(state.get("pot", 0) or 0), 1)
@@ -644,6 +668,8 @@ def postflop_decision(state):
     if owed == 0 or state.get("can_check"):
         if equity >= 0.74 or (equity >= 0.66 and spr <= 1.2):
             if spr <= 1.1:
+                if public_thin_stackoff_risk(state, equity, spr, opponents, wet):
+                    return {"action": "check"}
                 return {"action": "all_in"}
             fraction = 0.72 if wet else 0.58
             return raise_to(state, invested + int(pot * fraction))
